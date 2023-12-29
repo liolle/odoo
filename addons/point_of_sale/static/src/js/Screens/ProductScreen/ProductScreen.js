@@ -16,7 +16,9 @@ odoo.define('point_of_sale.ProductScreen', function(require) {
     class ProductScreen extends ControlButtonsMixin(PosComponent) {
         setup() {
             super.setup();
-            useListener('update-selected-orderline', this._updateSelectedOrderline);
+            useListener('update-selected-orderline', (...args) => {
+                if (!this.env.pos.tempScreenIsShown) this._updateSelectedOrderline(...args);
+            });
             useListener('select-line', this._selectLine);
             useListener('set-numpad-mode', this._setNumpadMode);
             useListener('click-product', this._clickProduct);
@@ -249,13 +251,16 @@ odoo.define('point_of_sale.ProductScreen', function(require) {
             if (!product) {
                 // find the barcode in the backend
                 let foundProductIds = [];
+                const foundPackagings = [];
                 try {
-                    foundProductIds = await this.rpc({
-                        model: 'product.product',
-                        method: 'search',
-                        args: [[['barcode', '=', code.base_code], ['sale_ok', '=', true]]],
+                    const { product_id = [], packaging = [] } = await this.rpc({
+                        model: 'pos.session',
+                        method: 'find_product_by_barcode',
+                        args: [odoo.pos_session_id, code.base_code],
                         context: this.env.session.user_context,
                     });
+                    foundProductIds.push(...product_id);
+                    foundPackagings.push(...packaging);
                 } catch (error) {
                     if (isConnectionError(error)) {
                         return this.showPopup('OfflineErrorPopup', {
@@ -267,7 +272,10 @@ odoo.define('point_of_sale.ProductScreen', function(require) {
                     }
                 }
                 if (foundProductIds.length) {
-                    await this.env.pos._addProducts(foundProductIds);
+                    await this.env.pos._addProducts(foundProductIds, false);
+                    if (foundPackagings.length) {
+                        this.env.pos.db.add_packagings(foundPackagings);
+                    }
                     // assume that the result is unique.
                     product = this.env.pos.db.get_product_by_id(foundProductIds[0]);
                 } else {

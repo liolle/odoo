@@ -142,7 +142,7 @@ class HrExpense(models.Model):
         for expense in self:
             expense.same_currency = bool(not expense.company_id or (expense.currency_id and expense.currency_id == expense.company_currency_id))
 
-    @api.depends('product_id')
+    @api.depends('product_id.standard_price')
     def _compute_product_has_cost(self):
         for expense in self:
             expense.product_has_cost = expense.product_id and (float_compare(expense.product_id.standard_price, 0.0, precision_digits=2) != 0)
@@ -289,12 +289,13 @@ class HrExpense(models.Model):
         for expense in self:
             expense.product_uom_id = expense.product_id.uom_id
 
-    @api.depends('product_id', 'attachment_number')
+    @api.depends('product_id', 'attachment_number', 'currency_rate')
     def _compute_unit_amount(self):
         for expense in self:
-            # Only change unit_amount if the product has cost defined on it
             if expense.product_id and expense.product_has_cost and not expense.attachment_number or (expense.attachment_number and not expense.unit_amount):
                 expense.unit_amount = expense.product_id.price_compute('standard_price', currency=expense.currency_id)[expense.product_id.id]
+            else:  # Even if we don't add a product, the unit_amount is still used for the move.line balance computation
+                expense.unit_amount = expense.company_currency_id.round(expense.total_amount_company / (expense.quantity or 1))
 
     @api.depends('product_id', 'company_id')
     def _compute_tax_ids(self):
@@ -496,6 +497,8 @@ Or send your receipts at <a href="mailto:%(email)s?subject=Lunch%%20with%%20cust
             raise UserError(_("You cannot report expenses for different employees in the same report."))
         if any(not expense.product_id for expense in expenses_with_amount):
             raise UserError(_("You can not create report without category."))
+        if len(self.company_id) != 1:
+            raise UserError(_("You cannot report expenses for different companies in the same report."))
 
         # Check if two reports should be created
         own_expenses = expenses_with_amount.filtered(lambda x: x.payment_mode == 'own_account')
@@ -906,7 +909,7 @@ class HrExpenseSheet(models.Model):
         ('cancel', 'Refused')
     ], string='Status', index=True, readonly=True, tracking=True, copy=False, default='draft', required=True)
     payment_state = fields.Selection(
-        selection=lambda self: self.env["account.move"]._fields["payment_state"].selection,
+        lambda self: self.env["account.move"]._fields["payment_state"]._description_selection(self.env),
         string="Payment Status",
         store=True, readonly=True, copy=False, tracking=True, compute='_compute_payment_state')
     employee_id = fields.Many2one('hr.employee', string="Employee", required=True, readonly=True, tracking=True, states={'draft': [('readonly', False)]}, default=_default_employee_id, check_company=True, domain= lambda self: self.env['hr.expense']._get_employee_id_domain())
@@ -1125,6 +1128,9 @@ class HrExpenseSheet(models.Model):
         if any(not sheet.journal_id for sheet in self):
             raise UserError(_("Specify expense journal to generate accounting entries."))
 
+        if not self.employee_id.sudo().address_home_id:
+            raise UserError(_("The private address of the employee is required to post the expense report. Please add it on the employee form."))
+
         expense_line_ids = self.mapped('expense_line_ids')\
             .filtered(lambda r: not float_is_zero(r.total_amount, precision_rounding=(r.currency_id or self.env.company.currency_id).rounding))
         res = expense_line_ids.with_context(clean_context(self.env.context)).action_move_create()
@@ -1176,8 +1182,11 @@ class HrExpenseSheet(models.Model):
             amount = sum(self.expense_line_ids.mapped('total_amount'))
         move_lines = []
         for expense in self.expense_line_ids:
-            tax_data = self.env['account.tax']._compute_taxes([expense._convert_to_tax_base_line_dict(price_unit=expense.total_amount, currency=expense.currency_id)])
-            rate = abs(expense.total_amount / expense.total_amount_company)
+            expense_amount = expense.total_amount_company if self.is_multiple_currency else expense.total_amount
+            tax_data = self.env['account.tax']._compute_taxes([
+                expense._convert_to_tax_base_line_dict(price_unit=expense_amount, currency=currency)
+            ])
+            rate = abs(expense_amount / expense.total_amount_company)
             base_line_data, to_update = tax_data['base_lines_to_update'][0]  # Add base lines
             amount_currency = to_update['price_subtotal']
             expense_name = expense.name.split("\n")[0][:64]
@@ -1255,10 +1264,16 @@ class HrExpenseSheet(models.Model):
         }
 
     def action_unpost(self):
-        draft_moves = self.account_move_id.filtered(lambda _move: _move.state == 'draft')
+        self = self.with_context(clean_context(self.env.context))
+        moves = self.account_move_id
+        draft_moves = moves.filtered(lambda m: m.state == 'draft')
+        non_draft_moves = moves - draft_moves
+        non_draft_moves._reverse_moves(default_values_list=[{'invoice_date': fields.Date.context_today(move), 'ref': False} for move in non_draft_moves], cancel=True)
+        self.write({
+            'account_move_id': False,
+            'state': 'draft',
+        })
         draft_moves.unlink()
-        moves = self.account_move_id - draft_moves
-        moves._reverse_moves(default_values_list=[{'invoice_date': fields.Date.context_today(move), 'ref': False} for move in moves], cancel=True)
         self.reset_expense_sheets()
 
     def action_get_attachment_view(self):
@@ -1422,6 +1437,8 @@ class HrExpenseSheet(models.Model):
 
     def action_register_payment(self):
         ''' Open the account.payment.register wizard to pay the selected journal entries.
+        There can be more than one bank_account_id in the expense sheet when registering payment for multiple expenses.
+        The default_partner_bank_id is set only if there is one available, if more than one the field is left empty.
         :return: An action opening the account.payment.register wizard.
         '''
         return {
@@ -1431,7 +1448,7 @@ class HrExpenseSheet(models.Model):
             'context': {
                 'active_model': 'account.move',
                 'active_ids': self.account_move_id.ids,
-                'default_partner_bank_id': self.employee_id.sudo().bank_account_id.id,
+                'default_partner_bank_id': self.employee_id.sudo().bank_account_id.id if len(self.employee_id.sudo().bank_account_id.ids) <= 1 else None,
             },
             'target': 'new',
             'type': 'ir.actions.act_window',

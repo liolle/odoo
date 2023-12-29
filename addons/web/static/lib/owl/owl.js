@@ -713,12 +713,7 @@
                     info.push({ type: "child", idx: index });
                     el = document.createTextNode("");
                 }
-                const attrs = node.attributes;
-                const ns = attrs.getNamedItem("block-ns");
-                if (ns) {
-                    attrs.removeNamedItem("block-ns");
-                    currentNS = ns.value;
-                }
+                currentNS || (currentNS = node.namespaceURI);
                 if (!el) {
                     el = currentNS
                         ? document.createElementNS(currentNS, tagName)
@@ -734,6 +729,7 @@
                         const fragment = document.createElement("template").content;
                         fragment.appendChild(el);
                     }
+                    const attrs = node.attributes;
                     for (let i = 0; i < attrs.length; i++) {
                         const attrName = attrs[i].name;
                         const attrValue = attrs[i].value;
@@ -2080,7 +2076,7 @@
             set(target, key, value, receiver) {
                 const hadKey = objectHasOwnProperty.call(target, key);
                 const originalValue = Reflect.get(target, key, receiver);
-                const ret = Reflect.set(target, key, value, receiver);
+                const ret = Reflect.set(target, key, toRaw(value), receiver);
                 if (!hadKey && objectHasOwnProperty.call(target, key)) {
                     notifyReactives(target, KEYCHANGES);
                 }
@@ -2184,7 +2180,7 @@
             if (hadKey !== hasKey) {
                 notifyReactives(target, KEYCHANGES);
             }
-            if (originalValue !== value) {
+            if (originalValue !== target[getterName](key)) {
                 notifyReactives(target, key);
             }
             return ret;
@@ -3005,15 +3001,13 @@
             keys = [...collection.keys()];
             values = [...collection.values()];
         }
+        else if (Symbol.iterator in Object(collection)) {
+            keys = [...collection];
+            values = keys;
+        }
         else if (collection && typeof collection === "object") {
-            if (Symbol.iterator in collection) {
-                keys = [...collection];
-                values = keys;
-            }
-            else {
-                values = Object.values(collection);
-                keys = Object.keys(collection);
-            }
+            values = Object.values(collection);
+            keys = Object.keys(collection);
         }
         else {
             throw new OwlError(`Invalid loop expression: "${collection}" is not iterable`);
@@ -3206,7 +3200,14 @@
             this.translateFn = config.translateFn;
             this.translatableAttributes = config.translatableAttributes;
             if (config.templates) {
-                this.addTemplates(config.templates);
+                if (config.templates instanceof Document || typeof config.templates === "string") {
+                    this.addTemplates(config.templates);
+                }
+                else {
+                    for (const name in config.templates) {
+                        this.addTemplate(name, config.templates[name]);
+                    }
+                }
             }
         }
         static registerTemplate(name, fn) {
@@ -3214,6 +3215,10 @@
         }
         addTemplate(name, template) {
             if (name in this.rawTemplates) {
+                // this check can be expensive, just silently ignore double definitions outside dev mode
+                if (!this.dev) {
+                    return;
+                }
                 const rawTemplate = this.rawTemplates[name];
                 const currentAsString = typeof rawTemplate === "string"
                     ? rawTemplate
@@ -3857,7 +3862,7 @@
         createBlock(parentBlock, type, ctx) {
             const hasRoot = this.target.hasRoot;
             const block = new BlockDescription(this.target, type);
-            if (!hasRoot && !ctx.preventRoot) {
+            if (!hasRoot) {
                 this.target.hasRoot = true;
                 block.isRoot = true;
             }
@@ -3880,7 +3885,7 @@
             if (ctx.tKeyExpr) {
                 blockExpr = `toggler(${ctx.tKeyExpr}, ${blockExpr})`;
             }
-            if (block.isRoot && !ctx.preventRoot) {
+            if (block.isRoot) {
                 if (this.target.on) {
                     blockExpr = this.wrapWithEventCatcher(blockExpr, this.target.on);
                 }
@@ -4056,11 +4061,6 @@
             }
             // attributes
             const attrs = {};
-            const nameSpace = ast.ns || ctx.nameSpace;
-            if (nameSpace && isNewBlock) {
-                // specific namespace uri
-                attrs["block-ns"] = nameSpace;
-            }
             for (let key in ast.attrs) {
                 let expr, attrName;
                 if (key.startsWith("t-attf")) {
@@ -4176,7 +4176,10 @@
                 const idx = block.insertData(setRefStr, "ref");
                 attrs["block-ref"] = String(idx);
             }
-            const dom = xmlDoc.createElement(ast.tag);
+            const nameSpace = ast.ns || ctx.nameSpace;
+            const dom = nameSpace
+                ? xmlDoc.createElementNS(nameSpace, ast.tag)
+                : xmlDoc.createElement(ast.tag);
             for (const [attr, val] of Object.entries(attrs)) {
                 if (!(attr === "class" && val === "")) {
                     dom.setAttribute(attr, val);
@@ -4218,7 +4221,7 @@
                                 break;
                         }
                     }
-                    this.addLine(`let ${block.children.map((c) => c.varName)};`, codeIdx);
+                    this.addLine(`let ${block.children.map((c) => c.varName).join(", ")};`, codeIdx);
                 }
             }
             return block.varName;
@@ -4321,7 +4324,7 @@
                                 break;
                         }
                     }
-                    this.addLine(`let ${block.children.map((c) => c.varName)};`, codeIdx);
+                    this.addLine(`let ${block.children.map((c) => c.varName).join(", ")};`, codeIdx);
                 }
                 // note: this part is duplicated from end of compilemulti:
                 const args = block.children.map((c) => c.varName).join(", ");
@@ -4436,7 +4439,6 @@
                     block,
                     index,
                     forceNewBlock: !isTSet,
-                    preventRoot: ctx.preventRoot,
                     isLast: ctx.isLast && i === l - 1,
                 });
                 this.compileAST(child, subCtx);
@@ -4445,21 +4447,19 @@
                 }
             }
             if (isNewBlock) {
-                if (block.hasDynamicChildren) {
-                    if (block.children.length) {
-                        const code = this.target.code;
-                        const children = block.children.slice();
-                        let current = children.shift();
-                        for (let i = codeIdx; i < code.length; i++) {
-                            if (code[i].trimStart().startsWith(`const ${current.varName} `)) {
-                                code[i] = code[i].replace(`const ${current.varName}`, current.varName);
-                                current = children.shift();
-                                if (!current)
-                                    break;
-                            }
+                if (block.hasDynamicChildren && block.children.length) {
+                    const code = this.target.code;
+                    const children = block.children.slice();
+                    let current = children.shift();
+                    for (let i = codeIdx; i < code.length; i++) {
+                        if (code[i].trimStart().startsWith(`const ${current.varName} `)) {
+                            code[i] = code[i].replace(`const ${current.varName}`, current.varName);
+                            current = children.shift();
+                            if (!current)
+                                break;
                         }
-                        this.addLine(`let ${block.children.map((c) => c.varName)};`, codeIdx);
                     }
+                    this.addLine(`let ${block.children.map((c) => c.varName).join(", ")};`, codeIdx);
                 }
                 const args = block.children.map((c) => c.varName).join(", ");
                 this.insertBlock(`multi([${args}])`, block, ctx);
@@ -4473,22 +4473,21 @@
                 ctxVar = generateId("ctx");
                 this.addLine(`let ${ctxVar} = ${compileExpr(ast.context)};`);
             }
+            const isDynamic = INTERP_REGEXP.test(ast.name);
+            const subTemplate = isDynamic ? interpolate(ast.name) : "`" + ast.name + "`";
+            if (block && !forceNewBlock) {
+                this.insertAnchor(block);
+            }
+            block = this.createBlock(block, "multi", ctx);
             if (ast.body) {
                 this.addLine(`${ctxVar} = Object.create(${ctxVar});`);
                 this.addLine(`${ctxVar}[isBoundary] = 1;`);
                 this.helpers.add("isBoundary");
-                const subCtx = createContext(ctx, { preventRoot: true, ctxVar });
+                const subCtx = createContext(ctx, { ctxVar });
                 const bl = this.compileMulti({ type: 3 /* Multi */, content: ast.body }, subCtx);
                 if (bl) {
                     this.helpers.add("zero");
                     this.addLine(`${ctxVar}[zero] = ${bl};`);
-                }
-            }
-            const isDynamic = INTERP_REGEXP.test(ast.name);
-            const subTemplate = isDynamic ? interpolate(ast.name) : "`" + ast.name + "`";
-            if (block) {
-                if (!forceNewBlock) {
-                    this.insertAnchor(block);
                 }
             }
             const key = `key + \`${this.generateComponentKey()}\``;
@@ -4498,7 +4497,6 @@
                     this.staticDefs.push({ id: "call", expr: `app.callTemplate.bind(app)` });
                 }
                 this.define(templateVar, subTemplate);
-                block = this.createBlock(block, "multi", ctx);
                 this.insertBlock(`call(this, ${templateVar}, ${ctxVar}, node, ${key})`, block, {
                     ...ctx,
                     forceNewBlock: !block,
@@ -4507,7 +4505,6 @@
             else {
                 const id = generateId(`callTemplate_`);
                 this.staticDefs.push({ id, expr: `app.getTemplate(${subTemplate})` });
-                block = this.createBlock(block, "multi", ctx);
                 this.insertBlock(`${id}.call(this, ${ctxVar}, node, ${key})`, block, {
                     ...ctx,
                     forceNewBlock: !block,
@@ -4829,7 +4826,7 @@
     }
     function _parse(xml) {
         normalizeXML(xml);
-        const ctx = { inPreTag: false, inSVG: false };
+        const ctx = { inPreTag: false };
         return parseNode(xml, ctx) || { type: 0 /* Text */, value: "" };
     }
     function parseNode(node, ctx) {
@@ -4920,9 +4917,7 @@
         if (tagName === "pre") {
             ctx.inPreTag = true;
         }
-        const shouldAddSVGNS = ROOT_SVG_TAGS.has(tagName) && !ctx.inSVG;
-        ctx.inSVG = ctx.inSVG || shouldAddSVGNS;
-        const ns = shouldAddSVGNS ? "http://www.w3.org/2000/svg" : null;
+        let ns = !ctx.nameSpace && ROOT_SVG_TAGS.has(tagName) ? "http://www.w3.org/2000/svg" : null;
         const ref = node.getAttribute("t-ref");
         node.removeAttribute("t-ref");
         const nodeAttrsNames = node.getAttributeNames();
@@ -4984,6 +4979,9 @@
             else if (attr.startsWith("block-")) {
                 throw new OwlError(`Invalid attribute: '${attr}'`);
             }
+            else if (attr === "xmlns") {
+                ns = value;
+            }
             else if (attr !== "t-name") {
                 if (attr.startsWith("t-") && !attr.startsWith("t-att")) {
                     throw new OwlError(`Unknown QWeb directive: '${attr}'`);
@@ -4995,6 +4993,9 @@
                 attrs = attrs || {};
                 attrs[attr] = value;
             }
+        }
+        if (ns) {
+            ctx.nameSpace = ns;
         }
         const children = parseChildren(node, ctx);
         return {
@@ -5288,14 +5289,14 @@
                 // be ignored)
                 let el = slotNode.parentElement;
                 let isInSubComponent = false;
-                while (el !== clone) {
+                while (el && el !== clone) {
                     if (el.hasAttribute("t-component") || el.tagName[0] === el.tagName[0].toUpperCase()) {
                         isInSubComponent = true;
                         break;
                     }
                     el = el.parentElement;
                 }
-                if (isInSubComponent) {
+                if (isInSubComponent || !el) {
                     continue;
                 }
                 slotNode.removeAttribute("t-set-slot");
@@ -5564,7 +5565,7 @@
     }
 
     // do not modify manually. This file is generated by the release script.
-    const version = "2.2.4";
+    const version = "2.2.7";
 
     // -----------------------------------------------------------------------------
     //  Scheduler
@@ -5653,13 +5654,8 @@
 This is not suitable for production use.
 See https://github.com/odoo/owl/blob/${hash}/doc/reference/app.md#configuration for more information.`;
     };
-    window.__OWL_DEVTOOLS__ || (window.__OWL_DEVTOOLS__ = {
-        apps: new Set(),
-        Fiber: Fiber,
-        RootFiber: RootFiber,
-        toRaw: toRaw,
-        reactive: reactive,
-    });
+    const apps = new Set();
+    window.__OWL_DEVTOOLS__ || (window.__OWL_DEVTOOLS__ = { apps, Fiber, RootFiber, toRaw, reactive });
     class App extends TemplateSet {
         constructor(Root, config = {}) {
             super(config);
@@ -5667,7 +5663,7 @@ See https://github.com/odoo/owl/blob/${hash}/doc/reference/app.md#configuration 
             this.root = null;
             this.name = config.name || "";
             this.Root = Root;
-            window.__OWL_DEVTOOLS__.apps.add(this);
+            apps.add(this);
             if (config.test) {
                 this.dev = true;
             }
@@ -5724,7 +5720,7 @@ See https://github.com/odoo/owl/blob/${hash}/doc/reference/app.md#configuration 
                 this.root.destroy();
                 this.scheduler.processTasks();
             }
-            window.__OWL_DEVTOOLS__.apps.delete(this);
+            apps.delete(this);
         }
         createComponent(name, isStatic, hasSlotsProp, hasDynamicPropList, propList) {
             const isDynamic = !isStatic;
@@ -5799,6 +5795,7 @@ See https://github.com/odoo/owl/blob/${hash}/doc/reference/app.md#configuration 
         }
     }
     App.validateTarget = validateTarget;
+    App.apps = apps;
     App.version = version;
     async function mount(C, target, config = {}) {
         return new App(C, config).mount(target, config);
@@ -5915,7 +5912,7 @@ See https://github.com/odoo/owl/blob/${hash}/doc/reference/app.md#configuration 
      *
      * @template T
      * @param {Effect<T>} effect the effect to run on component mount and/or patch
-     * @param {()=>T} [computeDependencies=()=>[NaN]] a callback to compute
+     * @param {()=>[...T]} [computeDependencies=()=>[NaN]] a callback to compute
      *      dependencies that will decide if the effect needs to be cleaned up and
      *      run again. If the dependencies did not change, the effect will not run
      *      again. The default value returns an array containing only NaN because
@@ -6033,8 +6030,8 @@ See https://github.com/odoo/owl/blob/${hash}/doc/reference/app.md#configuration 
     Object.defineProperty(exports, '__esModule', { value: true });
 
 
-    __info__.date = '2023-08-02T06:20:03.634Z';
-    __info__.hash = '8f9ad98';
+    __info__.date = '2023-12-06T13:56:01.636Z';
+    __info__.hash = 'e94428a';
     __info__.url = 'https://github.com/odoo/owl';
 
 
